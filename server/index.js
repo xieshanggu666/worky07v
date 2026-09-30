@@ -3,7 +3,7 @@ import { db, run, all, get } from './db.js'
 
 const app = express()
 app.use(express.json())
-const PORT = 4180
+const PORT = Number(process.env.PORT) || 4180
 const PTS = [25, 18, 15, 12, 10, 8, 6, 4, 2, 1]
 // 天气对整场比赛的总体系数（用于部件磨损判定等）
 const WEATHER = { '晴': 1.0, '风': 0.96, '雨': 0.9, '雾': 0.84, '雷暴': 0.78 }
@@ -202,64 +202,112 @@ function buildRace(c) {
 // 读取/解析比赛记录
 const parseRace = r => (r ? { ...r, settled: !!r.settled, record: JSON.parse(r.record) } : null)
 function getRaceRow(id) { return get('SELECT * FROM races WHERE id=?', Number(id)) }
+// 单场已结算比赛的发奖口径（与 settleRace 完全一致）；历史修复按此逐项反向回滚
+function raceEffect(row, c) {
+  let rec = null
+  try { rec = JSON.parse(row.record) } catch (e) { rec = null }
+  const rank = row.rank ?? rec?.result?.rank ?? c?.rank ?? 6
+  const pts = row.pts ?? rec?.result?.pts ?? (PTS[rank - 1] || 1)
+  const money = row.money ?? rec?.result?.money ?? 0
+  const wear = row.wear ?? rec?.result?.wear ?? 0
+  const repGain = row.rep_gain ?? rec?.result?.repGain ?? Math.max(1, 5 - rank + (c?.diff || 0))
+  return { row, rec, rank, pts, money, wear, repGain }
+}
+// 反向回滚单场已结算比赛：部件磨损（parts_dur/hp）与机师经验、心情同积分奖金一道冲回，
+// 保证「资源状态」与「战绩」始终一致。维护等操作若已介入，恢复值以 100 为上限，不会溢出。
+function reverseSettledRace(row, c) {
+  const g = raceEffect(row, c)
+  const a = airship()
+  run('UPDATE airships SET parts_dur=MIN(100,parts_dur+?), hp=MIN(100,hp+?) WHERE id=?', g.wear, g.wear, a.id)
+  const pilotId = g.rec?.factors?.pilot?.id
+  if (pilotId) {
+    const expGain = g.rank <= 4 ? 3 : 1   // 与 settleRace 的发奖口径逐字对应
+    const moodLoss = g.rank > 8 ? 6 : 2
+    run('UPDATE pilots SET exp=MAX(0,exp-?), mood=MIN(100,MAX(0,mood+?)) WHERE id=?',
+      expGain, moodLoss, pilotId)
+  }
+  return g
+}
 function settleRace(id) {
   const row = getRaceRow(id)
   if (!row) return { ok: false, status: 404, msg: '比赛记录不存在' }
+  if (row.status === 'void') return { ok: false, status: 409, msg: '该比赛已在历史修复中作废，不能再次结算' }
   if (row.settled) return { ok: true, already: true, race: parseRace(row) } // 幂等：重复结算直接返回，不重复发奖
 
   const rec = JSON.parse(row.record)
   const c = get('SELECT * FROM circuits WHERE id=?', row.circuit_id)
+  let result
   db.exec('BEGIN')
   try {
-    if (c?.finished) { // 极端兜底：赛站已完赛则只补齐记录状态，绝不重复发奖
-      run("UPDATE races SET status='settled', settled=1, settled_at=? WHERE id=?", now(), row.id)
+    // 事务内二次确认闸门：同步执行下杜绝并发/重放造成的重复发奖
+    const again = getRaceRow(id)
+    if (again.status === 'void') {
+      result = { ok: false, status: 409, msg: '该比赛已在历史修复中作废，不能再次结算' }
+    } else if (again.settled) {
+      result = { ok: true, already: true, race: parseRace(again) }
+    } else if (c?.finished) {
+      // 极端兜底：赛站已被另一场比赛结算 → 本条记录作废，绝不重复发奖，也不混入历史战绩
+      run("UPDATE races SET status='void', settled=0, voided_at=? WHERE id=?", now(), row.id)
+      result = { ok: false, status: 409, msg: '该赛站已完赛，此条比赛记录已作废' }
     } else {
-      const { rank, pts, money, wear, repGain } = rec.result
-      const a = airship()
-      const newPd = Math.max(10, a.parts_dur - wear)
-      run('UPDATE airships SET parts_dur=?, hp=? WHERE id=?', newPd, Math.max(20, a.hp - wear), a.id)
-      if (rec.factors.pilot) {
-        run('UPDATE pilots SET exp=exp+?, mood=MIN(100,MAX(0,mood-?)) WHERE id=?',
-          rank <= 4 ? 3 : 1, rank > 8 ? 6 : 2, rec.factors.pilot.id)
+      // 顺序闸门：仅当前待赛站可结算；running 记录正常必然命中，越站脏数据在此被拦截
+      const cur = nextCircuit()
+      if (!cur || cur.id !== row.circuit_id) {
+        result = { ok: false, status: 409, msg: '前置赛站尚未完赛，该比赛暂不能结算' }
+      } else {
+        const { rank, pts, money, wear, repGain } = rec.result
+        const a = airship()
+        const newPd = Math.max(10, a.parts_dur - wear)
+        run('UPDATE airships SET parts_dur=?, hp=? WHERE id=?', newPd, Math.max(20, a.hp - wear), a.id)
+        if (rec.factors.pilot) {
+          run('UPDATE pilots SET exp=exp+?, mood=MIN(100,MAX(0,mood-?)) WHERE id=?',
+            rank <= 4 ? 3 : 1, rank > 8 ? 6 : 2, rec.factors.pilot.id)
+        }
+        run('UPDATE team SET money=money+?, rep=rep+?, season_pts=season_pts+? WHERE id=1', money, repGain, pts)
+        const ranksDone = all('SELECT rank FROM circuits WHERE finished=1')
+        const best = Math.min(rank, ...ranksDone.map(r => r.rank))
+        run('UPDATE team SET season_pos=? WHERE id=1', Math.max(1, best))
+        run('UPDATE circuits SET finished=1, rank=? WHERE id=?', rank, row.circuit_id)
+        const note = rec.factors.weather === '晴' ? `晴空万里，${rec.circuit.name}` : `${rec.factors.weather}天，${rec.circuit.name}`
+        run('INSERT INTO race_log (circuit_id, race_id, season, rank, pts, money, note, ts) VALUES (?,?,?,?,?,?,?,?)',
+          row.circuit_id, row.id, rec.season, rank, pts, money, note, now())
+        run("UPDATE races SET status='settled', settled=1, rank=?, pts=?, money=?, wear=?, rep_gain=?, settled_at=? WHERE id=?",
+          rank, pts, money, wear, repGain, now(), row.id)
+        reconcileSponsors() // 同一事务内对账赞助商
+        result = { ok: true, already: false, race: parseRace(getRaceRow(id)) }
       }
-      run('UPDATE team SET money=money+?, rep=rep+?, season_pts=season_pts+? WHERE id=1', money, repGain, pts)
-      const ranksDone = all('SELECT rank FROM circuits WHERE finished=1')
-      const best = Math.min(rank, ...ranksDone.map(r => r.rank))
-      run('UPDATE team SET season_pos=? WHERE id=1', Math.max(1, best))
-      run('UPDATE circuits SET finished=1, rank=? WHERE id=?', rank, row.circuit_id)
-      const note = rec.factors.weather === '晴' ? `晴空万里，${rec.circuit.name}` : `${rec.factors.weather}天，${rec.circuit.name}`
-      run('INSERT INTO race_log (circuit_id, race_id, season, rank, pts, money, note, ts) VALUES (?,?,?,?,?,?,?,?)',
-        row.circuit_id, row.id, rec.season, rank, pts, money, note, now())
-      run("UPDATE races SET status='settled', settled=1, rank=?, pts=?, money=?, wear=?, rep_gain=?, settled_at=? WHERE id=?",
-        rank, pts, money, wear, repGain, now(), row.id)
-      reconcileSponsors() // 同一事务内对账赞助商
     }
     db.exec('COMMIT')
   } catch (e) {
     db.exec('ROLLBACK')
     throw e
   }
-  return { ok: true, already: false, race: parseRace(getRaceRow(id)) }
+  return result
 }
 // 赞助商对账：以当前赛季积分为唯一事实来源，earned 与是否达标保持一致
 function reconcileSponsors() {
-  const pts = teamCore().season_pts
+  const pts = Number(teamCore().season_pts) || 0
   all('SELECT * FROM sponsors').forEach(s => {
     if (!s.reward) return
-    const reached = pts >= s.target
-    if (reached && !s.earned) {
+    const reached = pts >= (Number(s.target) || 0)
+    const earned = !!s.earned
+    if (reached && !earned) {
       run('UPDATE team SET money=money+?, rep=rep+? WHERE id=1', s.reward, s.rep)
       run('UPDATE sponsors SET earned=1, affinity=affinity+10 WHERE id=?', s.id)
-    } else if (!reached && s.earned) {
+    } else if (!reached && earned) {
       run('UPDATE team SET money=money-?, rep=rep-? WHERE id=1', s.reward, s.rep)
       run('UPDATE sponsors SET earned=0, affinity=affinity-10 WHERE id=?', s.id)
     }
   })
 }
 
-// 历史数据兼容：修复「跳站参赛」产生的脏数据——首个未完成赛站之后的完赛记录
-// 一律视为越站，回滚其积分/奖金/声望，删除流水并重置赛站，再统一重算赞助与赛季名次。
-// 部件磨损是完赛即发生的真实损耗，予以保留。
+// 历史数据兼容（迁移补偿）：修复「跳站参赛」产生的脏数据——首个未完成赛站之后的
+// 完赛记录一律视为越站。在同一事务内：
+//   1) 按各场记录的发奖口径，回滚积分/奖金/声望/部件磨损（parts_dur、hp）/机师经验与心情；
+//   2) 删除对应 race_log 流水（含无记录关联的老版残留流水）；
+//   3) 将这些赛站的 races 记录一律置为 void（作废，不再出现在历史战绩、不能续看或再结算）；
+//   4) 重置赛站，再统一重算赞助商对账与赛季名次。
+// 函数天然幂等：已作废的记录与已删流水在重启时不会被再次统计。
 function reconcileLegacySkips() {
   const cs = orderedCircuits()
   const firstOpen = cs.findIndex(c => !c.finished)
@@ -267,25 +315,53 @@ function reconcileLegacySkips() {
   const skipped = cs.slice(firstOpen + 1).filter(c => c.finished)
   if (!skipped.length) return
 
-  let ptsBack = 0, moneyBack = 0, repBack = 0
-  skipped.forEach(c => {
-    all('SELECT * FROM race_log WHERE circuit_id=?', c.id).forEach(l => {
-      ptsBack += l.pts || 0
-      moneyBack += l.money || 0
-      run('DELETE FROM race_log WHERE id=?', l.id)
+  db.exec('BEGIN')
+  try {
+    let ptsBack = 0, moneyBack = 0, repBack = 0, wearBack = 0, racesVoided = 0, expBack = 0, moodBack = 0
+    skipped.forEach(c => {
+      // 已被 races 记录认领的流水 id：其数额随记录回滚，兜底循环里不得再统计，避免双重回滚
+      const claimedLogIds = new Set()
+      // 该越站赛站的全部比赛记录：已结算的按记录反向回滚；running 仅作废（从未发奖）
+      all('SELECT * FROM races WHERE circuit_id=? ORDER BY id ASC', c.id).forEach(rw => {
+        if (rw.settled || rw.status === 'settled') {
+          const g = reverseSettledRace(rw, c)
+          ptsBack += g.pts; moneyBack += g.money; repBack += g.repGain; wearBack += g.wear
+          if (g.rec?.factors?.pilot?.id) {
+            expBack += g.rank <= 4 ? 3 : 1
+            moodBack += g.rank > 8 ? 6 : 2
+          }
+          if (rw.id) all('SELECT id FROM race_log WHERE race_id=?', rw.id).forEach(l => claimedLogIds.add(l.id))
+        }
+        run("UPDATE races SET status='void', settled=0, voided_at=? WHERE id=?", now(), rw.id)
+        racesVoided += 1
+      })
+      // 兜底：早期版本可能留下无 races 关联（或关联未结算记录）的流水，按其自身数额补偿，
+      // 声望缺失时按名次/难度重算；已被上面的比赛记录认领的流水一律跳过，确保每条只回滚一次
+      all('SELECT * FROM race_log WHERE circuit_id=?', c.id).forEach(l => {
+        if (claimedLogIds.has(l.id)) { run('DELETE FROM race_log WHERE id=?', l.id); return }
+        ptsBack += l.pts || 0
+        moneyBack += l.money || 0
+        repBack += Math.max(1, 5 - (l.rank || c.rank || 6) + c.diff)
+        run('DELETE FROM race_log WHERE id=?', l.id)
+      })
+      console.log(`[SKY] 历史修复：赛站《${c.name}》在前置赛站未完成时已完赛（名次 ${c.rank}），回滚战绩、奖励、部件磨损与人员经验`)
+      run('UPDATE circuits SET finished=0, rank=NULL WHERE id=?', c.id)
     })
-    repBack += Math.max(1, 5 - (c.rank || 6) + c.diff)
-    console.log(`[SKY] 历史修复：赛站《${c.name}》在前置赛站未完成时已完赛（名次 ${c.rank}），回滚战绩与奖励`)
-    run('UPDATE circuits SET finished=0, rank=NULL WHERE id=?', c.id)
-  })
-  if (ptsBack || moneyBack || repBack) {
-    run('UPDATE team SET season_pts=MAX(0,season_pts-?), money=money-?, rep=rep-? WHERE id=1', ptsBack, moneyBack, repBack)
-  }
+    if (ptsBack || moneyBack || repBack) {
+      run('UPDATE team SET season_pts=MAX(0,season_pts-?), money=money-?, rep=rep-? WHERE id=1', ptsBack, moneyBack, repBack)
+    }
 
-  reconcileSponsors()
-  const ranks = orderedCircuits().filter(x => x.finished && x.rank).map(x => x.rank)
-  run('UPDATE team SET season_pos=? WHERE id=1', ranks.length ? Math.max(1, Math.min(...ranks)) : 1)
-  console.log(`[SKY] 历史修复完成：回滚 ${skipped.length} 个越站赛站，积分 -${ptsBack}，奖金 -${moneyBack}，声望 -${repBack}`)
+    reconcileSponsors()
+    const ranks = orderedCircuits().filter(x => x.finished && x.rank).map(x => x.rank)
+    run('UPDATE team SET season_pos=? WHERE id=1', ranks.length ? Math.max(1, Math.min(...ranks)) : 1)
+    db.exec('COMMIT')
+    console.log(`[SKY] 历史修复完成：作废 ${racesVoided} 条越站比赛记录（${skipped.length} 个赛站），` +
+      `积分 -${ptsBack}，奖金 -${moneyBack}，声望 -${repBack}，部件磨损恢复 +${wearBack}，机师经验 -${expBack}、心情 +${moodBack}`)
+  } catch (e) {
+    db.exec('ROLLBACK')
+    console.error('[SKY] 历史修复失败，已回滚本次迁移补偿', e)
+    throw e
+  }
 }
 seed()
 reconcileLegacySkips()
@@ -415,11 +491,12 @@ app.post('/api/races/:id/progress', (req, res) => {
   res.json({ ok: true, watch_el: el })
 })
 
-// 结算：以比赛记录为唯一依据；幂等，重复/断线重放都只发一次奖
+// 结算：以比赛记录为唯一依据；幂等，重复/断线重放都只发一次奖；已作废记录返回 409
 app.post('/api/races/:id/settle', (req, res) => {
   try {
     const r = settleRace(Number(req.params.id))
     if (r.status === 404) return res.status(404).json(r)
+    if (r.status === 409) return res.status(409).json(r)
     res.json(r)
   } catch (e) {
     console.error('[SKY] 结算失败', e)

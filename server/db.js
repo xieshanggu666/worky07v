@@ -98,12 +98,15 @@ CREATE TABLE IF NOT EXISTS races (
   record TEXT NOT NULL,                    -- 分段过程、快照因素、事件与奖励（JSON）
   watch_el REAL NOT NULL DEFAULT 0,        -- 最近观赛进度（秒），中断续看
   created_at TEXT,
-  settled_at TEXT
+  settled_at TEXT,
+  voided_at TEXT                           -- 作废时间：越站迁移作废的记录，不再参与历史/结算
 );
 `)
 
 // 老库兼容：为 race_log 增补 race_id 列（已存在则忽略）
 try { db.exec('ALTER TABLE race_log ADD COLUMN race_id INTEGER') } catch (e) {}
+// 老库兼容：races 增加 voided_at 列（越站历史修复作废记录用）
+try { db.exec('ALTER TABLE races ADD COLUMN voided_at TEXT') } catch (e) {}
 
 export function run(sql, ...p) { return db.prepare(sql).run(...p) }
 export function all(sql, ...p) { return db.prepare(sql).all(...p) }

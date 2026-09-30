@@ -86,7 +86,12 @@ async function finish() {
   const r = await store.settleRace(props.race.id)
   settling.value = false
   if (r.ok) showSettle.value = true
-  else { settleCalled = false; store.tip(r.msg || '结算失败，请重试') }
+  else {
+    settleCalled = false
+    store.tip(r.msg || '结算失败，请重试')
+    // 记录可能已被重启时的历史修复作废：拉取最新状态，使航线/资源/战绩回到服务器口径
+    await store.refresh()
+  }
 }
 function skipToEnd() {
   if (raf) cancelAnimationFrame(raf)
