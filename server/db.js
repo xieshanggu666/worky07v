@@ -104,6 +104,9 @@ CREATE TABLE IF NOT EXISTS races (
 
 // 老库兼容：为 race_log 增补 race_id 列（已存在则忽略）
 try { db.exec('ALTER TABLE race_log ADD COLUMN race_id INTEGER') } catch (e) {}
+// 老库兼容：为 races 增补结算冗余列（已存在则忽略），历史越站修复依赖这些列精确回滚
+;['rank INTEGER', 'pts INTEGER DEFAULT 0', 'money REAL DEFAULT 0', 'wear INTEGER DEFAULT 0', 'rep_gain INTEGER DEFAULT 0']
+  .forEach(col => { try { db.exec(`ALTER TABLE races ADD COLUMN ${col}`) } catch (e) {} })
 
 export function run(sql, ...p) { return db.prepare(sql).run(...p) }
 export function all(sql, ...p) { return db.prepare(sql).all(...p) }

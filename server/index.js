@@ -257,35 +257,122 @@ function reconcileSponsors() {
   })
 }
 
-// 历史数据兼容：修复「跳站参赛」产生的脏数据——首个未完成赛站之后的完赛记录
-// 一律视为越站，回滚其积分/奖金/声望，删除流水并重置赛站，再统一重算赞助与赛季名次。
-// 部件磨损是完赛即发生的真实损耗，予以保留。
+// 结算对资源产生的全部副作用（与 settleRace 内发放逻辑严格镜像，供历史越站回滚使用）
+function settleEffects(rec) {
+  const { rank, pts, money, wear, repGain } = rec.result
+  return {
+    pts, money,
+    wear: wear || 0,
+    repGain: repGain || 0,
+    expGain: rank <= 4 ? 3 : 1,          // 对应 settleRace：前四 +3 经验，其余 +1
+    moodLoss: rank > 8 ? 6 : 2,          // 对应 settleRace：名次靠后 -6 心情，其余 -2
+    pilotId: rec.factors.pilot ? rec.factors.pilot.id : null
+  }
+}
+
+// 历史数据兼容：修复「跳站参赛」产生的脏数据。首个未完成赛站之后的完赛记录一律视为越站：
+// 结算时产生的积分/奖金/声望、机师经验与心情、部件磨损与耐久全部回滚，races 记录与 race_log
+// 流水同步删除、赛站重置，再统一重算赞助与赛季名次。旧版本迁移只回滚了积分/奖金/声望，
+// 遗留的 settled 幽灵记录（赛站已重置却仍能在历史战绩回放）会在重启后在此补齐经验/心情/磨损
+// 补偿并删除，杜绝「资源状态与战绩脱节」。全程事务、天然幂等，跑完一次再跑无任何可回滚数据。
 function reconcileLegacySkips() {
   const cs = orderedCircuits()
   const firstOpen = cs.findIndex(c => !c.finished)
-  if (firstOpen === -1) return
-  const skipped = cs.slice(firstOpen + 1).filter(c => c.finished)
-  if (!skipped.length) return
+  if (firstOpen === -1) return // 整季完赛，无脏数据
+  const skipIds = new Set(cs.slice(firstOpen + 1).filter(c => c.finished).map(c => c.id))
+  const openIds = new Set(cs.filter(c => !c.finished).map(c => c.id))
 
-  let ptsBack = 0, moneyBack = 0, repBack = 0
-  skipped.forEach(c => {
-    all('SELECT * FROM race_log WHERE circuit_id=?', c.id).forEach(l => {
-      ptsBack += l.pts || 0
-      moneyBack += l.money || 0
-      run('DELETE FROM race_log WHERE id=?', l.id)
-    })
-    repBack += Math.max(1, 5 - (c.rank || 6) + c.diff)
-    console.log(`[SKY] 历史修复：赛站《${c.name}》在前置赛站未完成时已完赛（名次 ${c.rank}），回滚战绩与奖励`)
-    run('UPDATE circuits SET finished=0, rank=NULL WHERE id=?', c.id)
+  // 越站赛站（finished 却位于首个未完成站之后）+ 未完成赛站上的 settled 幽灵记录，全部待修复
+  const ghostRows = all("SELECT * FROM races WHERE status='settled' OR settled=1")
+    .filter(r => skipIds.has(r.circuit_id) || openIds.has(r.circuit_id))
+  if (!ghostRows.length) return
+
+  const byCircuit = new Map()
+  ghostRows.forEach(r => {
+    if (!byCircuit.has(r.circuit_id)) byCircuit.set(r.circuit_id, [])
+    byCircuit.get(r.circuit_id).push(r)
   })
-  if (ptsBack || moneyBack || repBack) {
-    run('UPDATE team SET season_pts=MAX(0,season_pts-?), money=money-?, rep=rep-? WHERE id=1', ptsBack, moneyBack, repBack)
-  }
 
-  reconcileSponsors()
-  const ranks = orderedCircuits().filter(x => x.finished && x.rank).map(x => x.rank)
-  run('UPDATE team SET season_pos=? WHERE id=1', ranks.length ? Math.max(1, Math.min(...ranks)) : 1)
-  console.log(`[SKY] 历史修复完成：回滚 ${skipped.length} 个越站赛站，积分 -${ptsBack}，奖金 -${moneyBack}，声望 -${repBack}`)
+  db.exec('BEGIN')
+  try {
+    let ptsBack = 0, moneyBack = 0, repBack = 0, wearBack = 0
+    const pilotBack = new Map() // pilotId -> 待恢复 { exp, mood }
+    const raceIds = []
+
+    for (const [cid, rows] of byCircuit) {
+      const isSkip = skipIds.has(cid)
+      const circuit = cs.find(c => c.id === cid)
+      let logs = all('SELECT * FROM race_log WHERE circuit_id=?', cid)
+      rows.sort((a, b) => a.id - b.id)
+
+      rows.forEach((row, ri) => {
+        const rec = JSON.parse(row.record)
+        const fx = settleEffects(rec)
+        // 一场结算仅一条流水：优先按 race_id 精确匹配；老库流水无 race_id 时由最早一场认领。
+        // 积分/奖金/声望的回滚以「删除对应流水」为准——旧版迁移当年也是在删流水的同一循环里
+        // 退的奖：没有流水可删（旧版已退过）就绝不重复扣减。
+        const exact = logs.find(l => l.race_id === row.id)
+        const legacy = !exact && ri === 0 ? logs.find(l => l.race_id == null) : null
+        const log = exact || legacy
+        if (log) {
+          ptsBack += log.pts || 0
+          moneyBack += log.money || 0
+          repBack += row.rep_gain || fx.repGain
+          run('DELETE FROM race_log WHERE id=?', log.id)
+          logs = logs.filter(l => l.id !== log.id)
+        }
+        // 经验/心情/磨损旧版迁移从未回滚（本次要补齐的补偿），无论有无流水都按记录恢复
+        wearBack += fx.wear
+        if (fx.pilotId) {
+          const pb = pilotBack.get(fx.pilotId) || { exp: 0, mood: 0 }
+          pb.exp += fx.expGain
+          pb.mood += fx.moodLoss
+          pilotBack.set(fx.pilotId, pb)
+        }
+        raceIds.push(row.id)
+        if (isSkip) {
+          console.log(`[SKY] 历史修复：赛站《${circuit?.name}》在前置赛站未完成时已完赛（名次 ${row.rank ?? rec.result.rank}），回滚战绩、奖励、经验与磨损`)
+        } else {
+          console.log(`[SKY] 历史修复：赛站《${circuit?.name}》存在遗留的已结算记录（旧版迁移未补偿），补齐回滚人员经验与部件磨损`)
+        }
+      })
+
+      // 兜底：清理无法关联到结算记录的残留流水（崩溃半迁移/更老版本数据），其奖励一并回滚
+      logs.forEach(l => {
+        ptsBack += l.pts || 0
+        moneyBack += l.money || 0
+        repBack += Math.max(1, 5 - (l.rank || 6) + (circuit?.diff || 0))
+        run('DELETE FROM race_log WHERE id=?', l.id)
+      })
+
+      if (isSkip) run('UPDATE circuits SET finished=0, rank=NULL WHERE id=?', cid)
+    }
+
+    if (ptsBack || moneyBack || repBack) {
+      run('UPDATE team SET season_pts=MAX(0,season_pts-?), money=MAX(0,money-?), rep=MAX(0,rep-?) WHERE id=1',
+        ptsBack, moneyBack, repBack)
+    }
+    if (wearBack) { // 回滚部件损耗：健康度与耐久恢复，上限 100（赛后维护过的部分不会被重复补偿）
+      const a = airship()
+      run('UPDATE airships SET parts_dur=MIN(100,parts_dur+?), hp=MIN(100,hp+?) WHERE id=?', wearBack, wearBack, a.id)
+    }
+    for (const [pid, pb] of pilotBack) {
+      run('UPDATE pilots SET exp=MAX(0,exp-?), mood=MIN(100,MAX(0,mood+?)) WHERE id=?', pb.exp, pb.mood, pid)
+    }
+    if (raceIds.length) {
+      const stmt = db.prepare(`DELETE FROM races WHERE id IN (${raceIds.map(() => '?').join(',')})`)
+      stmt.run(...raceIds)
+    }
+
+    reconcileSponsors() // 同一事务内按回滚后的积分重新对账赞助商
+    const ranks = orderedCircuits().filter(x => x.finished && x.rank).map(x => x.rank)
+    run('UPDATE team SET season_pos=? WHERE id=1', ranks.length ? Math.max(1, Math.min(...ranks)) : 1)
+    console.log(`[SKY] 历史修复完成：回滚 ${raceIds.length} 场越站/遗留结算，积分 -${ptsBack}，奖金 -${moneyBack}，声望 -${repBack}，磨损恢复 +${wearBack}，人员经验/心情已同步`)
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
 }
 seed()
 reconcileLegacySkips()
